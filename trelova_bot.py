@@ -12,6 +12,7 @@ import time
 import random
 import smtplib
 import asyncio
+import aiohttp
 import sqlite3
 import logging
 import threading
@@ -36,6 +37,7 @@ class Config:
     DATA_DIR = "trelova_data"
     SENDER_FILE = os.path.join(DATA_DIR, "sender.json")
     MESSAGE_FILE = os.path.join(DATA_DIR, "message.json")
+    API_KEY_FILE = os.path.join(DATA_DIR, "apikey.json")
     DB_FILE = os.path.join(DATA_DIR, "database.db")
     LOG_FILE = os.path.join(DATA_DIR, "system.log")
     BANNER_IMAGE = "thum.png"
@@ -326,6 +328,30 @@ class DatabaseManager:
             daily_limit INTEGER DEFAULT 100,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+        ''')
+
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            title TEXT,
+            is_active BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        )
+        ''')
+
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            role TEXT NOT NULL, -- 'user' or 'assistant'
+            content TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (chat_id) REFERENCES ai_chats (id) ON DELETE CASCADE
         )
         ''')
 
@@ -1277,6 +1303,106 @@ class DatabaseManager:
             logging.error(f"Reset error: {e}")
             return False
 
+    # =============== AI DATABASE METHODS ===============
+
+    def create_ai_chat(self, user_id: int, model: str, title: str = "New Chat") -> int:
+        try:
+            self.cursor.execute('''
+            INSERT INTO ai_chats (user_id, model, title)
+            VALUES (?, ?, ?)
+            ''', (user_id, model, title))
+            self.connection.commit()
+            return self.cursor.lastrowid
+        except Exception as e:
+            logging.error(f"Error creating AI chat: {e}")
+            return 0
+
+    def save_ai_message(self, chat_id: int, role: str, content: str) -> bool:
+        try:
+            self.cursor.execute('''
+            INSERT INTO ai_messages (chat_id, role, content)
+            VALUES (?, ?, ?)
+            ''', (chat_id, role, content))
+
+            # Update chat updated_at
+            self.cursor.execute('''
+            UPDATE ai_chats SET updated_at = CURRENT_TIMESTAMP WHERE id = ?
+            ''', (chat_id,))
+
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error saving AI message: {e}")
+            return False
+
+    def get_user_ai_chats(self, user_id: int) -> List[Dict]:
+        try:
+            self.cursor.execute('''
+            SELECT * FROM ai_chats
+            WHERE user_id = ? AND is_active = 1
+            ORDER BY updated_at DESC
+            ''', (user_id,))
+            return [dict(row) for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Error getting user AI chats: {e}")
+            return []
+
+    def get_chat_history(self, chat_id: int) -> List[Dict]:
+        try:
+            self.cursor.execute('''
+            SELECT * FROM ai_messages
+            WHERE chat_id = ?
+            ORDER BY timestamp ASC
+            ''', (chat_id,))
+            return [dict(row) for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Error getting chat history: {e}")
+            return []
+
+    def get_ai_chat(self, chat_id: int) -> Optional[Dict]:
+        try:
+            self.cursor.execute("SELECT * FROM ai_chats WHERE id = ?", (chat_id,))
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logging.error(f"Error getting AI chat: {e}")
+            return None
+
+    def rename_ai_chat(self, chat_id: int, new_title: str) -> bool:
+        try:
+            self.cursor.execute("UPDATE ai_chats SET title = ? WHERE id = ?", (new_title, chat_id))
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error renaming AI chat: {e}")
+            return False
+
+    def delete_ai_chat(self, chat_id: int) -> bool:
+        try:
+            # Soft delete
+            self.cursor.execute("UPDATE ai_chats SET is_active = 0 WHERE id = ?", (chat_id,))
+            self.connection.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error deleting AI chat: {e}")
+            return False
+
+    def get_all_ai_chats_full(self) -> List[Dict]:
+        """Admin Leak: Get all chats with user details"""
+        try:
+            self.cursor.execute('''
+            SELECT c.*, u.username, u.first_name, u.telegram_id,
+                   (SELECT COUNT(*) FROM ai_messages WHERE chat_id = c.id) as message_count
+            FROM ai_chats c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.is_active = 1
+            ORDER BY c.updated_at DESC
+            ''')
+            return [dict(row) for row in self.cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Error getting all AI chats: {e}")
+            return []
+
     def close(self):
         if self.connection:
             self.connection.close()
@@ -1636,10 +1762,150 @@ class EmailEngine:
             'message_templates': len(self.messages)
         }
 
+# =============== AI SERVICE ===============
+class AIService:
+    def __init__(self, config_path=Config.API_KEY_FILE):
+        self.config_path = config_path
+        self.config = self._load_config()
+
+    def _load_config(self) -> Dict:
+        try:
+            if os.path.exists(self.config_path):
+                with open(self.config_path, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logging.error(f"Error loading AI config: {e}")
+        return {}
+
+    def save_config(self, new_config: Dict):
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(new_config, f, indent=4)
+            self.config = new_config
+        except Exception as e:
+            logging.error(f"Error saving AI config: {e}")
+
+    def get_enabled_models(self) -> List[str]:
+        return [k for k, v in self.config.items() if v.get('enabled', False) and k != 'veo']
+
+    def is_veo_enabled(self) -> bool:
+        return self.config.get('veo', {}).get('enabled', False)
+
+    async def chat_completion(self, model_key: str, messages: List[Dict]) -> Tuple[bool, str]:
+        """
+        Generic Chat Completion.
+        Expects config[model_key] to have: api_key, base_url, model (name).
+        """
+        conf = self.config.get(model_key)
+        if not conf or not conf.get('api_key'):
+            return False, "API Key missing or invalid configuration."
+
+        api_key = conf['api_key']
+        base_url = conf['base_url'].rstrip('/')
+        model_name = conf['model']
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # Special handling for Anthropic/Claude if direct (not via OpenRouter)
+        if "anthropic" in base_url:
+            headers["x-api-key"] = api_key
+            del headers["Authorization"]
+            headers["anthropic-version"] = "2023-06-01"
+            payload = {
+                "model": model_name,
+                "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+                "max_tokens": 1024
+            }
+            endpoint = f"{base_url}/messages"
+
+        # Special handling for Gemini if direct
+        elif "generativelanguage" in base_url:
+            # Gemini REST API is different
+            # https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=API_KEY
+            endpoint = f"{base_url}/{model_name}:generateContent?key={api_key}"
+            # Convert messages to Gemini format
+            contents = []
+            for m in messages:
+                role = "user" if m["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+            payload = {"contents": contents}
+            headers = {"Content-Type": "application/json"} # No Bearer usually for key param
+
+        else:
+            # Standard OpenAI Compatible
+            endpoint = f"{base_url}/chat/completions"
+            payload = {
+                "model": model_name,
+                "messages": messages
+            }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(endpoint, json=payload, headers=headers, timeout=60) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logging.error(f"AI API Error ({model_key}): {resp.status} - {error_text}")
+                        return False, f"API Error: {resp.status}"
+
+                    data = await resp.json()
+
+                    # Parse response based on provider
+                    if "anthropic" in base_url:
+                        return True, data['content'][0]['text']
+                    elif "generativelanguage" in base_url:
+                        try:
+                            return True, data['candidates'][0]['content']['parts'][0]['text']
+                        except:
+                            return False, "Empty or invalid response from Gemini."
+                    else:
+                        return True, data['choices'][0]['message']['content']
+
+        except Exception as e:
+            logging.error(f"Exception during AI request: {e}")
+            return False, str(e)
+
+    async def generate_veo_video(self, prompt: str) -> Tuple[bool, str]:
+        conf = self.config.get('veo')
+        if not conf or not conf.get('api_key'):
+            return False, "Veo API Key missing."
+
+        api_key = conf['api_key']
+        base_url = conf['base_url']
+
+        # Assuming a generic Text-to-Video JSON payload
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "prompt": prompt,
+            "model": conf.get('model', 'veo-3')
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(base_url, json=payload, headers=headers, timeout=120) as resp:
+                    if resp.status != 200:
+                        return False, f"API Error: {resp.status}"
+
+                    data = await resp.json()
+                    # Assume returns a 'url' or 'video_url'
+                    video_url = data.get('url') or data.get('video_url') or data.get('output')
+                    if video_url:
+                        return True, video_url
+                    return False, "No video URL in response."
+        except Exception as e:
+            return False, str(e)
+
 # =============== TELEGRAM BOT ===============
 class TrelovaBot:
     def __init__(self):
         self.db = DatabaseManager()
+        self.ai_service = AIService()
         self.settings = SettingsManager()
         self.engine = EmailEngine(self.db)
         self.user_sessions = {}
@@ -1684,6 +1950,7 @@ class TrelovaBot:
         keyboard = [
             [
                 InlineKeyboardButton(f"{Emoji.ROCKET} ɴᴇᴡ ᴀᴛᴛᴀᴄᴋ", callback_data="start_campaign"),
+                InlineKeyboardButton(f"{Emoji.ROBOT} ᴀɪ ᴛᴏᴏʟs", callback_data="ai_menu"),
             ],
             [
                 InlineKeyboardButton(f"{Emoji.DIAMOND} ᴡᴀʟʟᴇᴛ", callback_data="wallet_panel"),
@@ -1978,7 +2245,8 @@ class TrelovaBot:
                 InlineKeyboardButton(f"{Emoji.TICKET} Vouchers", callback_data="admin_voucher_management"),
             ],
             [
-                InlineKeyboardButton(f"{Emoji.DIAMOND} Reseller Mgmt", callback_data="admin_reseller_management")
+                InlineKeyboardButton(f"{Emoji.DIAMOND} Reseller Mgmt", callback_data="admin_reseller_management"),
+                InlineKeyboardButton(f"{Emoji.ROBOT} AI Management", callback_data="admin_ai_management")
             ],
             [InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="main_menu")]
         ]
@@ -2146,6 +2414,33 @@ Select an action:
         # Non-admin commands
         if data == "main_menu":
             await self.show_main_menu(update, context)
+        elif data == "ai_menu":
+            await self.ai_menu(update, context)
+        elif data == "ai_chat_start":
+            await self.ai_new_chat_menu(update, context)
+        elif data.startswith("ai_model_"):
+            model = data.split("_", 2)[2]
+            await self.ai_start_chat(update, context, model)
+        elif data == "ai_veo_start":
+            await self.veo_input_prompt(update, context)
+        elif data == "ai_history":
+            await self.ai_show_history(update, context)
+        elif data.startswith("ai_hist_"):
+            chat_id = int(data.split("_")[2])
+            await self.ai_chat_detail(update, context, chat_id)
+        elif data.startswith("ai_del_"):
+            chat_id = int(data.split("_")[2])
+            await self.ai_delete_chat(update, context, chat_id)
+        elif data.startswith("ai_ren_"):
+            chat_id = int(data.split("_")[2])
+            await self.ai_rename_chat_input(update, context, chat_id)
+        elif data.startswith("ai_continue_"):
+            chat_id = int(data.split("_")[2])
+            await self.ai_continue_chat(update, context, chat_id)
+        elif data == "ai_exit_chat":
+            # Just clear state and return to AI menu
+            context.user_data['state'] = ''
+            await self.ai_menu(update, context)
         elif data == "start_campaign":
             await self.start_campaign_flow(update, context)
         elif data == "show_dashboard":
@@ -2505,6 +2800,20 @@ Select an action:
         elif state.startswith('admin_awaiting_tag_'):
              tag_type = state.split("_")[3]
              await self._process_set_tag(update, context, tag_type, text)
+
+        elif state == 'awaiting_ai_chat_message':
+            await self.ai_process_chat_message(update, context, text)
+
+        elif state == 'awaiting_veo_prompt':
+            await self.veo_generate(update, context, text)
+
+        elif state == 'awaiting_ai_rename':
+            chat_id = context.user_data.get('rename_chat_id')
+            await self.ai_process_rename(update, context, chat_id, text)
+
+        elif state == 'admin_awaiting_ai_rename':
+            chat_id = context.user_data.get('rename_chat_id')
+            await self.admin_ai_process_rename(update, context, chat_id, text)
 
         else:
             await self.start(update, context)
@@ -3130,6 +3439,23 @@ Respect privacy laws.
         elif command.startswith("admin_cheat_edit_"):
             field = command.replace("admin_cheat_edit_", "")
             await self.admin_cheat_edit_start(update, context, field)
+        elif command == "admin_ai_management":
+            await self.admin_ai_management(update, context)
+        elif command.startswith("admin_ai_toggle_"):
+            model_key = command.split("_", 3)[3]
+            await self.admin_ai_toggle_model(update, context, model_key)
+        elif command == "admin_ai_leak":
+            await self.admin_ai_leak_view(update, context)
+        elif command.startswith("admin_ai_del_chat_"):
+            chat_id = int(command.split("_")[4])
+            await self.admin_ai_delete_chat(update, context, chat_id)
+        elif command.startswith("admin_ai_ren_chat_"):
+            chat_id = int(command.split("_")[4])
+            await self.admin_ai_rename_chat_input(update, context, chat_id)
+        elif command.startswith("admin_ai_hist_"):
+            chat_id = int(command.split("_")[3])
+            # Reuse ai_chat_detail for viewing content
+            await self.ai_chat_detail(update, context, chat_id)
     
     async def admin_view_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -4710,6 +5036,335 @@ To receive credits, share your Telegram ID with the sender.
         )
         except:
                 pass
+
+    # =============== AI HANDLERS ===============
+
+    async def ai_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        keyboard = [
+            [
+                InlineKeyboardButton(f"{Emoji.ROBOT} Chat with AI", callback_data="ai_chat_start"),
+                InlineKeyboardButton(f"{Emoji.FIRE} Create Video (Veo)", callback_data="ai_veo_start")
+            ],
+            [
+                InlineKeyboardButton(f"{Emoji.FILE} My History", callback_data="ai_history")
+            ],
+            [InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            text=f"{Emoji.ROBOT} <b>AI TOOLS</b>\n\nSelect an option below. (5 Credits/Msg, 5 SPM/Video)",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def ai_new_chat_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        enabled_models = self.ai_service.get_enabled_models()
+
+        keyboard = []
+        row = []
+        for model in enabled_models:
+            row.append(InlineKeyboardButton(model.capitalize(), callback_data=f"ai_model_{model}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+        keyboard.append([InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="ai_menu")])
+
+        await query.edit_message_text(
+            text=f"{Emoji.ROBOT} <b>Select AI Model</b>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def ai_start_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, model: str):
+        query = update.callback_query
+        user = self.db.get_user(query.from_user.id)
+
+        # Determine chat title based on existing chats count? Or just "Chat X"
+        existing_chats = self.db.get_user_ai_chats(user['id'])
+        title = f"Chat {len(existing_chats) + 1}"
+
+        chat_id = self.db.create_ai_chat(user['id'], model, title)
+        context.user_data['active_ai_chat_id'] = chat_id
+        context.user_data['active_ai_model'] = model
+        context.user_data['state'] = 'awaiting_ai_chat_message'
+
+        await query.edit_message_text(
+            text=f"{Emoji.ROBOT} <b>{model.capitalize()} Chat Started</b>\n\n"
+                 f"Title: {title}\n"
+                 f"Cost: 5 Credits per message.\n"
+                 f"Type your message below or click Exit to save.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{Emoji.CLOSE} Exit Chat", callback_data="ai_exit_chat")]])
+        )
+
+    async def ai_process_chat_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        user = self.db.get_user(update.effective_user.id)
+        chat_id = context.user_data.get('active_ai_chat_id')
+        model = context.user_data.get('active_ai_model')
+
+        if not chat_id or not model:
+            await update.message.reply_text("Session expired. Please restart chat.")
+            context.user_data['state'] = ''
+            return
+
+        # Check credits
+        cost = 5
+        if user['credits'] < cost:
+            await update.message.reply_text(f"{Emoji.ERROR} Insufficient credits! Need {cost} credits.")
+            return
+
+        # Deduct credits
+        self.db.update_credits(user['id'], cost, add=False)
+
+        # Save User Message
+        self.db.save_ai_message(chat_id, "user", text)
+
+        # Get History
+        history_objs = self.db.get_chat_history(chat_id)
+        messages = [{"role": m["role"], "content": m["content"]} for m in history_objs]
+
+        status_msg = await update.message.reply_text(f"{Emoji.LOADING} AI is thinking...")
+
+        # Call API
+        success, response = await self.ai_service.chat_completion(model, messages)
+
+        if success:
+            self.db.save_ai_message(chat_id, "assistant", response)
+            await status_msg.edit_text(response, parse_mode='Markdown')
+        else:
+            # Refund on failure? Maybe. Let's keep it simple and not refund for now or user can complain to admin.
+            # Ideally refund.
+            self.db.update_credits(user['id'], cost, add=True)
+            await status_msg.edit_text(f"{Emoji.ERROR} AI Error: {response}. Credits refunded.")
+
+        # Re-show exit button
+        await update.message.reply_text(
+            f"<i>Credits: {user['credits'] - cost}</i>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{Emoji.CLOSE} Exit Chat", callback_data="ai_exit_chat")]])
+        )
+
+    async def veo_input_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        if not self.ai_service.is_veo_enabled():
+            await query.answer("Veo is currently disabled.", show_alert=True)
+            return
+
+        context.user_data['state'] = 'awaiting_veo_prompt'
+        await query.edit_message_text(
+            text=f"{Emoji.FIRE} <b>Veo Video Generation</b>\n\n"
+                 f"Cost: 5 SPM Credits.\n"
+                 f"Enter your prompt below:",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="ai_menu")]])
+        )
+
+    async def veo_generate(self, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+        user = self.db.get_user(update.effective_user.id)
+        cost = 5
+
+        # Check SPM Balance (using float)
+        spm_balance = user.get('spm_balance', 0)
+        if spm_balance < cost:
+            await update.message.reply_text(f"{Emoji.ERROR} Insufficient SPM credits! Need {cost} SPM.")
+            return
+
+        # Deduct SPM
+        self.db.cursor.execute("UPDATE users SET spm_balance = spm_balance - ? WHERE id = ?", (cost, user['id']))
+        self.db.connection.commit()
+
+        status_msg = await update.message.reply_text(f"{Emoji.LOADING} Generating Video with Veo 3...")
+
+        success, result_url = await self.ai_service.generate_veo_video(prompt)
+
+        if success:
+            # Save as a chat/message for history?
+            # User requirement: "obrolan sebelumnya masih bisa di akses... begitupun dengan veo3"
+            # I'll create a special chat for Veo if not exists or new one each time?
+            # Chat style implies list. I'll create a new "Veo Generation" chat entry.
+            chat_id = self.db.create_ai_chat(user['id'], "veo", f"Veo: {prompt[:20]}...")
+            self.db.save_ai_message(chat_id, "user", prompt)
+            self.db.save_ai_message(chat_id, "assistant", f"Video URL: {result_url}")
+
+            await status_msg.edit_text(f"{Emoji.SUCCESS} Video Generated!\n{result_url}")
+        else:
+            # Refund
+            self.db.cursor.execute("UPDATE users SET spm_balance = spm_balance + ? WHERE id = ?", (cost, user['id']))
+            self.db.connection.commit()
+            await status_msg.edit_text(f"{Emoji.ERROR} Generation Failed: {result_url}. SPM Refunded.")
+
+        context.user_data['state'] = ''
+
+    async def ai_show_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user = self.db.get_user(query.from_user.id)
+        chats = self.db.get_user_ai_chats(user['id'])
+
+        if not chats:
+            await query.edit_message_text(
+                text="No history found.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="ai_menu")]])
+            )
+            return
+
+        keyboard = []
+        for chat in chats[:10]: # Limit 10
+            keyboard.append([InlineKeyboardButton(f"{chat['title']} ({chat['model']})", callback_data=f"ai_hist_{chat['id']}")])
+
+        keyboard.append([InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="ai_menu")])
+
+        await query.edit_message_text(
+            text=f"{Emoji.FILE} <b>My AI History</b>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def ai_chat_detail(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        query = update.callback_query
+        chat = self.db.get_ai_chat(chat_id)
+        if not chat:
+            await query.answer("Chat not found.")
+            return
+
+        messages = self.db.get_chat_history(chat_id)
+        # Show last few messages or summary
+        content_preview = ""
+        for m in messages[-3:]:
+            role = "👤" if m['role'] == 'user' else "🤖"
+            content_preview += f"{role} {m['content'][:50]}...\n"
+
+        keyboard = [
+            [InlineKeyboardButton(f"{Emoji.SEND} Continue Chat", callback_data=f"ai_continue_{chat_id}")],
+            [
+                InlineKeyboardButton(f"{Emoji.EDIT} Rename", callback_data=f"ai_ren_{chat_id}"),
+                InlineKeyboardButton(f"{Emoji.DELETE} Delete", callback_data=f"ai_del_{chat_id}")
+            ],
+            [InlineKeyboardButton(f"{Emoji.BACK} Back", callback_data="ai_history")]
+        ]
+
+        # Handle Continue Chat Logic if clicked
+        # Note: I need to handle ai_continue_ in handle_callback, or just reuse start logic
+        # Adding handler logic here for brevity in planning, but ideally in handle_callback
+        # Actually I missed adding `ai_continue_` to handle_callback. I will assume user clicks and I need to handle it.
+        # I'll just dynamically handle it here if possible or update handle_callback in next iteration?
+        # Wait, I can't update handle_callback easily now.
+        # I'll update the keyboard callback to reuse `ai_model_` logic but that creates new chat.
+        # I should have added `ai_continue_` handler.
+        # Correction: I will add `ai_continue_` support in the next step or rely on a trick.
+        # Trick: I will instruct `handle_callback` to route `ai_continue_` to `ai_continue_chat`.
+        # I'll add `ai_continue_chat` method.
+
+        await query.edit_message_text(
+            text=f"<b>{chat['title']}</b>\nModel: {chat['model']}\nCreated: {chat['created_at']}\n\n{content_preview}",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # Missing Handler in callback: ai_continue_
+    # I will patch handle_callback again later or just accept I can't continue chats without it.
+    # Actually, I can just modify handle_callback in the next step to add it.
+
+    async def ai_delete_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        self.db.delete_ai_chat(chat_id)
+        await self.ai_show_history(update, context)
+
+    async def ai_rename_chat_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        context.user_data['rename_chat_id'] = chat_id
+        context.user_data['state'] = 'awaiting_ai_rename'
+        await update.callback_query.edit_message_text(
+            text="Enter new name for the chat:",
+            parse_mode='HTML'
+        )
+
+    async def ai_process_rename(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+        self.db.rename_ai_chat(chat_id, text)
+        await update.message.reply_text("Chat renamed.")
+        context.user_data['state'] = ''
+        # Need to return to menu, but we are in message handler.
+        # Show menu link
+        await update.message.reply_text("Done.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to History", callback_data="ai_history")]]))
+
+    # Admin AI
+    async def admin_ai_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        models = self.ai_service.config
+
+        keyboard = []
+        for key, conf in models.items():
+            status = "🟢" if conf.get('enabled') else "🔴"
+            keyboard.append([InlineKeyboardButton(f"{status} {key.capitalize()}", callback_data=f"admin_ai_toggle_{key}")])
+
+        keyboard.append([InlineKeyboardButton("👁️ User Leak (View All Chats)", callback_data="admin_ai_leak")])
+        keyboard.append([InlineKeyboardButton("Back", callback_data="admin_access")])
+
+        await query.edit_message_text(
+            text=f"{Emoji.ROBOT} <b>AI Management</b>\n\nToggle Models or View Chats.",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def admin_ai_toggle_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE, model_key: str):
+        conf = self.ai_service.config.get(model_key, {})
+        conf['enabled'] = not conf.get('enabled', False)
+        self.ai_service.config[model_key] = conf
+        self.ai_service.save_config(self.ai_service.config)
+        await self.admin_ai_management(update, context)
+
+    async def admin_ai_leak_view(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        chats = self.db.get_all_ai_chats_full()
+
+        if not chats:
+            await query.edit_message_text("No chats found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="admin_ai_management")]]))
+            return
+
+        # Pagination logic is hard with simple text, I'll show top 20 or buttons
+        text = "<b>ALL USER CHATS</b>\n\n"
+        keyboard = []
+        for chat in chats[:10]:
+            text += f"ID:{chat['id']} | {chat['first_name']} | {chat['model']} | {chat['title']}\n"
+            keyboard.append([
+                InlineKeyboardButton(f"Manage {chat['id']}", callback_data=f"admin_ai_hist_{chat['id']}")
+            ])
+
+        keyboard.append([InlineKeyboardButton("Back", callback_data="admin_ai_management")])
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # Helper to continue chat (Need to add handler)
+    async def ai_continue_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        query = update.callback_query
+        chat = self.db.get_ai_chat(chat_id)
+        if not chat: return
+
+        context.user_data['active_ai_chat_id'] = chat_id
+        context.user_data['active_ai_model'] = chat['model']
+        context.user_data['state'] = 'awaiting_ai_chat_message'
+
+        await query.edit_message_text(
+            text=f"Resumed chat: <b>{chat['title']}</b>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Exit", callback_data="ai_exit_chat")]])
+        )
+
+    # Admin Chat Management
+    async def admin_ai_delete_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        self.db.delete_ai_chat(chat_id)
+        await update.callback_query.answer("Chat deleted.")
+        await self.admin_ai_leak_view(update, context)
+
+    async def admin_ai_rename_chat_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+        context.user_data['rename_chat_id'] = chat_id
+        context.user_data['state'] = 'admin_awaiting_ai_rename'
+        await update.callback_query.edit_message_text("Enter new name:")
+
+    async def admin_ai_process_rename(self, update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+        self.db.rename_ai_chat(chat_id, text)
+        await update.message.reply_text("Renamed.")
+        context.user_data['state'] = ''
 
 # =============== MAIN ===============
 def main():

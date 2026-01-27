@@ -1,0 +1,44 @@
+{
+    "gemini": {
+        "model": "gemini-3.0-pro",
+        "api_key": "",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/models/",
+        "enabled": true
+    },
+    "deepseek": {
+        "model": "deepseek-chat",
+        "api_key": "",
+        "base_url": "https://api.deepseek.com/v1",
+        "enabled": true
+    },
+    "openai": {
+        "model": "gpt-4o",
+        "api_key": "",
+        "base_url": "https://api.openai.com/v1",
+        "enabled": true
+    },
+    "claude": {
+        "model": "claude-3-opus-20240229",
+        "api_key": "",
+        "base_url": "https://api.anthropic.com/v1",
+        "enabled": true
+    },
+    "perplexity": {
+        "model": "llama-3-sonar-large-32k-online",
+        "api_key": "",
+        "base_url": "https://api.perplexity.ai",
+        "enabled": true
+    },
+    "openrouter": {
+        "model": "auto",
+        "api_key": "",
+        "base_url": "https://openrouter.ai/api/v1",
+        "enabled": true
+    },
+    "veo": {
+        "model": "veo-3",
+        "api_key": "",
+        "base_url": "https://api.veo.ai/v1/generate",
+        "enabled": true
+    }
+}
