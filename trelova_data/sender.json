@@ -1,0 +1,12 @@
+[
+    {
+        "id": 1,
+        "email": "your_email@gmail.com",
+        "password": "your_app_password",
+        "provider": "gmail",
+        "name": "Default Account",
+        "daily_limit": 100,
+        "sent_today": 0,
+        "is_active": true
+    }
+]
