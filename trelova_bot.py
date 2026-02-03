@@ -2590,7 +2590,7 @@ Select an action:
         elif state == 'awaiting_count_custom':
             try:
                 count = int(text)
-                if 1 <= count <= Config.MAX_EMAILS_PER_CAMPAIGN:
+                if 1 <= count <= Config.MAX_EMAILS_PER_ATTACK:
                     context.user_data['campaign_count'] = count
                     context.user_data['state'] = 'awaiting_delay'
                     
@@ -2601,7 +2601,7 @@ Select an action:
                     )
                 else:
                     await update.message.reply_text(
-                        text=f"{Emoji.ERROR} Must be 1-{Config.MAX_EMAILS_PER_CAMPAIGN}!",
+                        text=f"{Emoji.ERROR} Must be 1-{Config.MAX_EMAILS_PER_ATTACK}!",
                         parse_mode='HTML'
                     )
             except:
@@ -2837,7 +2837,7 @@ Select an action:
         if query.data == "count_custom":
             context.user_data['state'] = 'awaiting_count_custom'
             await query.edit_message_text(
-                text=f"{Emoji.EDIT} <b>CUSTOM COUNT</b>\nEnter number (1-{Config.MAX_EMAILS_PER_CAMPAIGN}):",
+                text=f"{Emoji.EDIT} <b>CUSTOM COUNT</b>\nEnter number (1-{Config.MAX_EMAILS_PER_ATTACK}):",
                 parse_mode='HTML'
             )
         else:
