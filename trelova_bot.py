@@ -1734,20 +1734,22 @@ class EmailEngine:
     def _get_main_menu(self) -> InlineKeyboardMarkup:
         keyboard = [
             [
-                InlineKeyboardButton(f"{Emoji.ROCKET} New Campaign", callback_data="start_campaign"),
+                InlineKeyboardButton(f"{Emoji.ROCKET} ɴᴇᴡ ᴀᴛᴛᴀᴄᴋ", callback_data="start_campaign"),
+                InlineKeyboardButton(f"{Emoji.ROBOT} ᴀɪ ᴛᴏᴏʟs", callback_data="ai_menu"),
             ],
             [
-                InlineKeyboardButton(f"{Emoji.CHART} Dashboard", callback_data="show_dashboard"),
-                InlineKeyboardButton(f"{Emoji.STATS} Statistics", callback_data="show_statistics")
+                InlineKeyboardButton(f"{Emoji.DIAMOND} ᴡᴀʟʟᴇᴛ", callback_data="wallet_panel"),
+                InlineKeyboardButton(f"{Emoji.CHART} ᴅᴀsʜʙᴏᴀʀᴅ", callback_data="show_dashboard"),
             ],
             [
-                InlineKeyboardButton(f"{Emoji.USER} My Profile", callback_data="my_profile"),
-                InlineKeyboardButton(f"{Emoji.SETTINGS} Settings", callback_data="open_settings"),
+                InlineKeyboardButton(f"{Emoji.USER} ᴘʀᴏғɪʟᴇ", callback_data="my_profile"),
+                InlineKeyboardButton(f"{Emoji.STATS} sᴛᴀᴛɪsᴛɪᴄs", callback_data="show_statistics")
             ],
             [
-                InlineKeyboardButton(f"{Emoji.ADMIN} Admin Panel", callback_data="admin_access"),
-                InlineKeyboardButton(f"{Emoji.INFO} About", callback_data="about_bot")
-            ]
+                InlineKeyboardButton(f"{Emoji.SETTINGS} sᴇᴛᴛɪɴɢs", callback_data="open_settings"),
+                InlineKeyboardButton(f"{Emoji.INFO} ᴀʙᴏᴜᴛ", callback_data="about_bot")
+            ],
+            [InlineKeyboardButton(f"{Emoji.ADMIN} ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", callback_data="admin_access")]
         ]
         return InlineKeyboardMarkup(keyboard)
     
@@ -3446,6 +3448,9 @@ Respect privacy laws.
             await self.admin_ai_toggle_model(update, context, model_key)
         elif command == "admin_ai_leak":
             await self.admin_ai_leak_view(update, context)
+        elif command.startswith("admin_user_leak_chats_"):
+            user_id = int(command.split("_")[4])
+            await self.admin_user_view_chats(update, context, user_id)
         elif command.startswith("admin_ai_del_chat_"):
             chat_id = int(command.split("_")[4])
             await self.admin_ai_delete_chat(update, context, chat_id)
@@ -4605,7 +4610,8 @@ Failed: {stats['total_failed']}
 Is Reseller: {stats.get('is_reseller')}
 Limit: {stats.get('reseller_limit')}
 """
-        await update.message.reply_text(msg, parse_mode='HTML')
+        keyboard = [[InlineKeyboardButton("👁️ View AI Chats", callback_data=f"admin_user_leak_chats_{stats['id']}")]]
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
         context.user_data['state'] = ''
 
     async def admin_reset_user_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5313,6 +5319,36 @@ To receive credits, share your Telegram ID with the sender.
         self.ai_service.config[model_key] = conf
         self.ai_service.save_config(self.ai_service.config)
         await self.admin_ai_management(update, context)
+
+    async def admin_user_view_chats(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        query = update.callback_query
+
+        # We need to fetch chats for this user ID.
+        # reusing get_user_ai_chats but we need to know the telegram_id or internal id?
+        # The user_id passed here from `admin_user_leak_chats_{id}` is the internal DB ID (from `stats['id']`).
+        # `get_user_ai_chats` expects internal user_id. Perfect.
+
+        chats = self.db.get_user_ai_chats(user_id)
+
+        if not chats:
+            await query.answer("No AI chats found for this user.", show_alert=True)
+            return
+
+        text = f"<b>USER {user_id} CHATS</b>\n\n"
+        keyboard = []
+        for chat in chats[:20]:
+            text += f"ID:{chat['id']} | {chat['model']} | {chat['title']}\n"
+            # Reuse admin_ai_hist_ for managing/viewing the chat details
+            keyboard.append([
+                InlineKeyboardButton(f"Manage {chat['id']}", callback_data=f"admin_ai_hist_{chat['id']}")
+            ])
+
+        # Add a back button to user leak or main admin?
+        # User leak input is state-based so hard to go back exactly there without re-input.
+        # Go back to User Management.
+        keyboard.append([InlineKeyboardButton("Back", callback_data="admin_user_management")])
+
+        await query.edit_message_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def admin_ai_leak_view(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
